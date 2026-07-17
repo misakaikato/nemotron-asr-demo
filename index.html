@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Nemotron 3.5 ASR Streaming · 本地体验</title>
+<style>
+	:root { color-scheme: light dark; }
+	body { font-family: -apple-system, "PingFang SC", sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+	h1 { font-size: 1.2rem; }
+	.row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .8rem 0; }
+	select, button { font-size: 1rem; padding: .4rem .8rem; }
+	button.rec { background: #d33; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+	button.rec.on { background: #333; }
+	#out { min-height: 8rem; border: 1px solid #8884; border-radius: 8px; padding: 1rem; font-size: 1.15rem; line-height: 1.7; white-space: pre-wrap; }
+	#stats { font-variant-numeric: tabular-nums; color: #888; font-size: .9rem; }
+	.hint { color: #888; font-size: .85rem; }
+	fieldset { border: 1px solid #8884; border-radius: 8px; margin-top: 1.5rem; }
+</style>
+</head>
+<body>
+<h1>🎙️ Nemotron 3.5 ASR Streaming 0.6B — 本地 MLX 真流式</h1>
+
+<div class="row">
+	语言 <select id="lang">
+		<option value="auto" selected>自动检测</option>
+		<option value="zh-CN">中文 zh-CN</option>
+		<option value="en-US">English en-US</option>
+		<option value="ja-JP">日本語 ja-JP</option>
+		<option value="ko-KR">한국어 ko-KR</option>
+		<option value="es-ES">Español es-ES</option>
+		<option value="fr-FR">Français fr-FR</option>
+		<option value="de-DE">Deutsch de-DE</option>
+		<option value="ru-RU">Русский ru-RU</option>
+	</select>
+	延迟档 <select id="latency">
+		<option>1.12s</option>
+		<option selected>0.56s</option>
+		<option>0.32s</option>
+		<option>0.08s</option>
+	</select>
+	<button id="btn" class="rec">开始录音</button>
+</div>
+
+<div class="row">
+	<label>热词(每行一个)</label>
+	<textarea id="hotwords" rows="3" cols="24" placeholder="上证指数&#10;大运&#10;Claude Code" style="font-size:.95rem"></textarea>
+	<label>强度 <input id="hweight" type="number" value="3" min="0.5" max="10" step="0.5" style="width:4rem"></label>
+</div>
+
+<div id="out" aria-live="polite"></div>
+<div class="row"><span id="stats"></span></div>
+<p class="hint">延迟档 = 模型 look-ahead(att_context),越小上屏越快、准确率略降。RTFx = 音频时长 ÷ 计算耗时(已剔除等麦克风的时间),>1 即快于实时。</p>
+
+<fieldset>
+	<legend>音频文件批式转写(测纯速度)</legend>
+	<div class="row">
+		<input type="file" id="file" accept="audio/*,.wav,.flac,.mp3,.m4a">
+		<button id="fbtn">转写</button>
+	</div>
+	<div id="fout" class="hint"></div>
+</fieldset>
+
+<script>
+const $ = id => document.getElementById(id);
+let ws, ctx, node, streamRef, running = false;
+
+$('btn').onclick = async () => running ? stop() : start();
+
+async function start() {
+	$('out').textContent = ''; $('stats').textContent = '连接中…';
+	ws = new WebSocket(`ws://${location.host}/ws`);
+	await new Promise((ok, err) => { ws.onopen = ok; ws.onerror = err; });
+	ws.send(JSON.stringify({
+		language: $('lang').value, latency: $('latency').value,
+		hotwords: $('hotwords').value, hotword_weight: +$('hweight').value || 3,
+	}));
+	ws.onmessage = e => {
+		const m = JSON.parse(e.data);
+		if (m.type === 'partial') {
+			$('out').textContent = m.text;
+			$('stats').textContent = `音频 ${m.audio_s}s · 计算 ${m.compute_s}s · RTFx ${m.rtfx ?? '—'}`;
+		} else if (m.type === 'final') {
+			$('stats').textContent += ' · 已完成';
+		} else if (m.type === 'error') {
+			$('stats').textContent = '出错: ' + m.message;
+		}
+	};
+
+	streamRef = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
+	ctx = new AudioContext({ sampleRate: 16000 });
+	const src = ctx.createMediaStreamSource(streamRef);
+	// ponytail: ScriptProcessor 已废弃但零依赖能用;卡顿再换 AudioWorklet
+	node = ctx.createScriptProcessor(4096, 1, 1);
+	node.onaudioprocess = e => {
+		if (ws.readyState !== 1) return;
+		const f32 = e.inputBuffer.getChannelData(0);
+		const i16 = new Int16Array(f32.length);
+		for (let i = 0; i < f32.length; i++) i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+		ws.send(i16.buffer);
+	};
+	src.connect(node); node.connect(ctx.destination);
+	running = true; $('btn').textContent = '停止'; $('btn').classList.add('on');
+	$('stats').textContent = '录音中…';
+}
+
+function stop() {
+	node?.disconnect(); ctx?.close(); streamRef?.getTracks().forEach(t => t.stop());
+	if (ws?.readyState === 1) ws.send('stop');
+	running = false; $('btn').textContent = '开始录音'; $('btn').classList.remove('on');
+}
+
+$('fbtn').onclick = async () => {
+	const f = $('file').files[0];
+	if (!f) return;
+	$('fout').textContent = '转写中…';
+	const fd = new FormData(); fd.append('file', f);
+	fd.append('hotwords', $('hotwords').value);
+	fd.append('hotword_weight', $('hweight').value || '3');
+	const r = await fetch(`/transcribe?language=${$('lang').value}`, { method: 'POST', body: fd });
+	const m = await r.json();
+	$('fout').textContent = r.ok
+		? `「${m.text}」\n音频 ${m.audio_s}s · 计算 ${m.compute_s}s · RTFx ${m.rtfx}`
+		: '失败: ' + JSON.stringify(m);
+};
+</script>
+</body>
+</html>
